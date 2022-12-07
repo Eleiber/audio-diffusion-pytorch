@@ -1,3 +1,4 @@
+from itertools import accumulate
 from math import floor, log, pi
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
@@ -8,23 +9,7 @@ from einops.layers.torch import Rearrange
 from einops_exts import rearrange_many
 from torch import Tensor, einsum
 
-from .utils import closest_power_2, default, exists, groupby
-
-"""
-Utils
-"""
-
-
-class ConditionedSequential(nn.Module):
-    def __init__(self, *modules):
-        super().__init__()
-        self.module_list = nn.ModuleList(*modules)
-
-    def forward(self, x: Tensor, mapping: Optional[Tensor] = None):
-        for module in self.module_list:
-            x = module(x, mapping)
-        return x
-
+from .utils import closest_power_2, default, exists, groupby, to_list
 
 """
 Convolutional Blocks
@@ -264,55 +249,6 @@ Attention Components
 """
 
 
-class RelativePositionBias(nn.Module):
-    def __init__(self, num_buckets: int, max_distance: int, num_heads: int):
-        super().__init__()
-        self.num_buckets = num_buckets
-        self.max_distance = max_distance
-        self.num_heads = num_heads
-        self.relative_attention_bias = nn.Embedding(num_buckets, num_heads)
-
-    @staticmethod
-    def _relative_position_bucket(
-        relative_position: Tensor, num_buckets: int, max_distance: int
-    ):
-        num_buckets //= 2
-        ret = (relative_position >= 0).to(torch.long) * num_buckets
-        n = torch.abs(relative_position)
-
-        max_exact = num_buckets // 2
-        is_small = n < max_exact
-
-        val_if_large = (
-            max_exact
-            + (
-                torch.log(n.float() / max_exact)
-                / log(max_distance / max_exact)
-                * (num_buckets - max_exact)
-            ).long()
-        )
-        val_if_large = torch.min(
-            val_if_large, torch.full_like(val_if_large, num_buckets - 1)
-        )
-
-        ret += torch.where(is_small, n, val_if_large)
-        return ret
-
-    def forward(self, num_queries: int, num_keys: int) -> Tensor:
-        i, j, device = num_queries, num_keys, self.relative_attention_bias.weight.device
-        q_pos = torch.arange(j - i, j, dtype=torch.long, device=device)
-        k_pos = torch.arange(j, dtype=torch.long, device=device)
-        rel_pos = rearrange(k_pos, "j -> 1 j") - rearrange(q_pos, "i -> i 1")
-
-        relative_position_bucket = self._relative_position_bucket(
-            rel_pos, num_buckets=self.num_buckets, max_distance=self.max_distance
-        )
-
-        bias = self.relative_attention_bias(relative_position_bucket)
-        bias = rearrange(bias, "m n h -> 1 h m n")
-        return bias
-
-
 def FeedForward(features: int, multiplier: int) -> nn.Module:
     mid_features = features * multiplier
     return nn.Sequential(
@@ -322,31 +258,28 @@ def FeedForward(features: int, multiplier: int) -> nn.Module:
     )
 
 
+class FixedEmbedding(nn.Module):
+    def __init__(self, max_length: int, features: int):
+        super().__init__()
+        self.max_length = max_length
+        self.embedding = nn.Embedding(max_length, features)
+
+    def forward(self, x: Tensor) -> Tensor:
+        batch_size, length, device = *x.shape[0:2], x.device
+        assert_message = "Input sequence length must be <= max_length"
+        assert length <= self.max_length, assert_message
+        position = torch.arange(length, device=device)
+        fixed_embedding = self.embedding(position)
+        fixed_embedding = repeat(fixed_embedding, "n d -> b n d", b=batch_size)
+        return fixed_embedding
+
+
 class AttentionBase(nn.Module):
-    def __init__(
-        self,
-        features: int,
-        *,
-        head_features: int,
-        num_heads: int,
-        use_rel_pos: bool,
-        rel_pos_num_buckets: Optional[int] = None,
-        rel_pos_max_distance: Optional[int] = None,
-    ):
+    def __init__(self, features: int, *, head_features: int, num_heads: int):
         super().__init__()
         self.scale = head_features ** -0.5
         self.num_heads = num_heads
-        self.use_rel_pos = use_rel_pos
         mid_features = head_features * num_heads
-
-        if use_rel_pos:
-            assert exists(rel_pos_num_buckets) and exists(rel_pos_max_distance)
-            self.rel_pos = RelativePositionBias(
-                num_buckets=rel_pos_num_buckets,
-                max_distance=rel_pos_max_distance,
-                num_heads=num_heads,
-            )
-
         self.to_out = nn.Linear(in_features=mid_features, out_features=features)
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
@@ -354,7 +287,6 @@ class AttentionBase(nn.Module):
         q, k, v = rearrange_many((q, k, v), "b n (h d) -> b h n d", h=self.num_heads)
         # Compute similarity matrix
         sim = einsum("... n d, ... m d -> ... n m", q, k)
-        sim = (sim + self.rel_pos(*sim.shape[-2:])) if self.use_rel_pos else sim
         sim = sim * self.scale
         # Get attention matrix with softmax
         attn = sim.softmax(dim=-1)
@@ -372,14 +304,21 @@ class Attention(nn.Module):
         head_features: int,
         num_heads: int,
         context_features: Optional[int] = None,
-        use_rel_pos: bool,
-        rel_pos_num_buckets: Optional[int] = None,
-        rel_pos_max_distance: Optional[int] = None,
+        use_positional_embedding: bool = False,
+        max_length: Optional[int] = None,
     ):
         super().__init__()
         self.context_features = context_features
+        self.use_positional_embedding = use_positional_embedding
         mid_features = head_features * num_heads
         context_features = default(context_features, features)
+
+        self.max_length = max_length
+        if use_positional_embedding:
+            assert exists(max_length)
+            self.positional_embedding = FixedEmbedding(
+                max_length=max_length, features=features
+            )
 
         self.norm = nn.LayerNorm(features)
         self.norm_context = nn.LayerNorm(context_features)
@@ -390,17 +329,14 @@ class Attention(nn.Module):
             in_features=context_features, out_features=mid_features * 2, bias=False
         )
         self.attention = AttentionBase(
-            features,
-            num_heads=num_heads,
-            head_features=head_features,
-            use_rel_pos=use_rel_pos,
-            rel_pos_num_buckets=rel_pos_num_buckets,
-            rel_pos_max_distance=rel_pos_max_distance,
+            features, num_heads=num_heads, head_features=head_features
         )
 
     def forward(self, x: Tensor, *, context: Optional[Tensor] = None) -> Tensor:
         assert_message = "You must provide a context when using context_features"
         assert not self.context_features or exists(context), assert_message
+        if self.use_positional_embedding:
+            x = x + self.positional_embedding(x)
         # Use context if provided
         context = default(context, x)
         # Normalize then compute q from input and k,v from context
@@ -422,10 +358,9 @@ class TransformerBlock(nn.Module):
         num_heads: int,
         head_features: int,
         multiplier: int,
-        use_rel_pos: bool,
-        rel_pos_num_buckets: Optional[int] = None,
-        rel_pos_max_distance: Optional[int] = None,
         context_features: Optional[int] = None,
+        use_positional_embedding: bool = False,
+        max_length: Optional[int] = None,
     ):
         super().__init__()
 
@@ -435,9 +370,8 @@ class TransformerBlock(nn.Module):
             features=features,
             num_heads=num_heads,
             head_features=head_features,
-            use_rel_pos=use_rel_pos,
-            rel_pos_num_buckets=rel_pos_num_buckets,
-            rel_pos_max_distance=rel_pos_max_distance,
+            use_positional_embedding=use_positional_embedding,
+            max_length=max_length,
         )
 
         if self.use_cross_attention:
@@ -446,9 +380,8 @@ class TransformerBlock(nn.Module):
                 num_heads=num_heads,
                 head_features=head_features,
                 context_features=context_features,
-                use_rel_pos=use_rel_pos,
-                rel_pos_num_buckets=rel_pos_num_buckets,
-                rel_pos_max_distance=rel_pos_max_distance,
+                use_positional_embedding=use_positional_embedding,
+                max_length=max_length,
             )
 
         self.feed_forward = FeedForward(features=features, multiplier=multiplier)
@@ -474,10 +407,9 @@ class Transformer1d(nn.Module):
         num_heads: int,
         head_features: int,
         multiplier: int,
-        use_rel_pos: bool = False,
-        rel_pos_num_buckets: Optional[int] = None,
-        rel_pos_max_distance: Optional[int] = None,
         context_features: Optional[int] = None,
+        use_positional_embedding: bool = False,
+        max_length: Optional[int] = None,
     ):
         super().__init__()
 
@@ -499,9 +431,8 @@ class Transformer1d(nn.Module):
                     num_heads=num_heads,
                     multiplier=multiplier,
                     context_features=context_features,
-                    use_rel_pos=use_rel_pos,
-                    rel_pos_num_buckets=rel_pos_num_buckets,
-                    rel_pos_max_distance=rel_pos_max_distance,
+                    use_positional_embedding=use_positional_embedding,
+                    max_length=max_length,
                 )
                 for i in range(num_layers)
             ]
@@ -589,9 +520,8 @@ class DownsampleBlock1d(nn.Module):
         attention_heads: Optional[int] = None,
         attention_features: Optional[int] = None,
         attention_multiplier: Optional[int] = None,
-        attention_use_rel_pos: Optional[bool] = None,
-        attention_rel_pos_max_distance: Optional[int] = None,
-        attention_rel_pos_num_buckets: Optional[int] = None,
+        attention_use_positional_embedding: bool = False,
+        attention_max_length: Optional[int] = None,
         context_mapping_features: Optional[int] = None,
         context_embedding_features: Optional[int] = None,
     ):
@@ -628,7 +558,6 @@ class DownsampleBlock1d(nn.Module):
                 exists(attention_heads)
                 and exists(attention_features)
                 and exists(attention_multiplier)
-                and exists(attention_use_rel_pos)
             )
             self.transformer = Transformer1d(
                 num_layers=num_transformer_blocks,
@@ -637,9 +566,8 @@ class DownsampleBlock1d(nn.Module):
                 head_features=attention_features,
                 multiplier=attention_multiplier,
                 context_features=context_embedding_features,
-                use_rel_pos=attention_use_rel_pos,
-                rel_pos_num_buckets=attention_rel_pos_num_buckets,
-                rel_pos_max_distance=attention_rel_pos_max_distance,
+                use_positional_embedding=attention_use_positional_embedding,
+                max_length=attention_max_length,
             )
 
         if self.use_extract:
@@ -703,9 +631,8 @@ class UpsampleBlock1d(nn.Module):
         attention_heads: Optional[int] = None,
         attention_features: Optional[int] = None,
         attention_multiplier: Optional[int] = None,
-        attention_use_rel_pos: Optional[bool] = None,
-        attention_rel_pos_max_distance: Optional[int] = None,
-        attention_rel_pos_num_buckets: Optional[int] = None,
+        attention_use_positional_embedding: bool = False,
+        attention_max_length: Optional[int] = None,
         context_mapping_features: Optional[int] = None,
         context_embedding_features: Optional[int] = None,
     ):
@@ -736,7 +663,6 @@ class UpsampleBlock1d(nn.Module):
                 exists(attention_heads)
                 and exists(attention_features)
                 and exists(attention_multiplier)
-                and exists(attention_use_rel_pos)
             )
             self.transformer = Transformer1d(
                 num_layers=num_transformer_blocks,
@@ -745,9 +671,8 @@ class UpsampleBlock1d(nn.Module):
                 head_features=attention_features,
                 multiplier=attention_multiplier,
                 context_features=context_embedding_features,
-                use_rel_pos=attention_use_rel_pos,
-                rel_pos_num_buckets=attention_rel_pos_num_buckets,
-                rel_pos_max_distance=attention_rel_pos_max_distance,
+                use_positional_embedding=attention_use_positional_embedding,
+                max_length=attention_max_length,
             )
 
         self.upsample = Upsample1d(
@@ -807,9 +732,8 @@ class BottleneckBlock1d(nn.Module):
         attention_heads: Optional[int] = None,
         attention_features: Optional[int] = None,
         attention_multiplier: Optional[int] = None,
-        attention_use_rel_pos: Optional[bool] = None,
-        attention_rel_pos_max_distance: Optional[int] = None,
-        attention_rel_pos_num_buckets: Optional[int] = None,
+        attention_use_positional_embedding: bool = False,
+        attention_max_length: Optional[int] = None,
         context_mapping_features: Optional[int] = None,
         context_embedding_features: Optional[int] = None,
     ):
@@ -828,7 +752,6 @@ class BottleneckBlock1d(nn.Module):
                 exists(attention_heads)
                 and exists(attention_features)
                 and exists(attention_multiplier)
-                and exists(attention_use_rel_pos)
             )
             self.transformer = Transformer1d(
                 num_layers=num_transformer_blocks,
@@ -837,9 +760,8 @@ class BottleneckBlock1d(nn.Module):
                 head_features=attention_features,
                 multiplier=attention_multiplier,
                 context_features=context_embedding_features,
-                use_rel_pos=attention_use_rel_pos,
-                rel_pos_num_buckets=attention_rel_pos_num_buckets,
-                rel_pos_max_distance=attention_rel_pos_max_distance,
+                use_positional_embedding=attention_use_positional_embedding,
+                max_length=attention_max_length,
             )
 
         self.post_block = ResnetBlock1d(
@@ -883,49 +805,36 @@ class UNet1d(nn.Module):
         kernel_multiplier_downsample: int = 2,
         use_nearest_upsample: bool = False,
         use_skip_scale: bool = True,
-        use_stft: bool = False,
-        use_stft_context: bool = False,
         out_channels: Optional[int] = None,
         context_features: Optional[int] = None,
         context_features_multiplier: int = 4,
         context_channels: Optional[Sequence[int]] = None,
         context_embedding_features: Optional[int] = None,
+        length: Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
+        # Args
         out_channels = default(out_channels, in_channels)
-        context_channels = list(default(context_channels, []))
-        num_layers = len(multipliers) - 1
-        use_context_features = exists(context_features)
-        use_context_channels = len(context_channels) > 0
-        context_mapping_features = None
-
         attention_kwargs, kwargs = groupby("attention_", kwargs, keep_prefix=True)
+        factors = to_list(factors)
 
+        # Number of layers with checks
+        num_layers = len(multipliers) - 1
         self.num_layers = num_layers
-        self.use_context_time = use_context_time
-        self.use_context_features = use_context_features
-        self.use_context_channels = use_context_channels
-        self.use_stft = use_stft
-        self.use_stft_context = use_stft_context
-
-        self.context_features = context_features
-        context_channels_pad_length = num_layers + 1 - len(context_channels)
-        context_channels = context_channels + [0] * context_channels_pad_length
-        self.context_channels = context_channels
-        self.context_embedding_features = context_embedding_features
-
-        if use_context_channels:
-            has_context = [c > 0 for c in context_channels]
-            self.has_context = has_context
-            self.channels_ids = [sum(has_context[:i]) for i in range(len(has_context))]
-
         assert (
             len(factors) == num_layers
             and len(attentions) >= num_layers
             and len(num_blocks) == num_layers
         )
 
+        # Context time and context features
+        self.use_context_time = use_context_time
+        use_context_features = exists(context_features)
+        self.use_context_features = use_context_features
+        self.context_features = context_features
+
+        context_mapping_features = None
         if use_context_time or use_context_features:
             context_mapping_features = channels * context_features_multiplier
 
@@ -954,16 +863,25 @@ class UNet1d(nn.Module):
                 nn.GELU(),
             )
 
-        if use_stft:
-            stft_kwargs, kwargs = groupby("stft_", kwargs)
-            assert "num_fft" in stft_kwargs, "stft_num_fft required if use_stft=True"
-            stft_channels = (stft_kwargs["num_fft"] // 2 + 1) * 2
-            in_channels *= stft_channels
-            out_channels *= stft_channels
-            context_channels[0] *= stft_channels if use_stft_context else 1
-            assert exists(in_channels) and exists(out_channels)
-            self.stft = STFT(**stft_kwargs)
+        # Context channels
+        context_channels = list(default(context_channels, []))
+        use_context_channels = len(context_channels) > 0
+        self.use_context_channels = use_context_channels
+        context_channels_pad_length = num_layers + 1 - len(context_channels)
+        context_channels = context_channels + [0] * context_channels_pad_length
+        self.context_channels = context_channels
+        self.context_embedding_features = context_embedding_features
+        if use_context_channels:
+            has_context = [c > 0 for c in context_channels]
+            self.has_context = has_context
+            self.channels_ids = [sum(has_context[:i]) for i in range(len(has_context))]
 
+        # Layer factor and length (used for fixed length posemb in attention)
+        factors_cumulative = [*accumulate([patch_size] + factors, lambda x, y: x * y)]
+        layer_lengths = [default(length, 0) // f for f in factors_cumulative]
+        self.layer_lengths = layer_lengths
+
+        # Check that all kwargs have been used
         assert not kwargs, f"Unknown arguments: {', '.join(list(kwargs.keys()))}"
 
         self.to_in = Patcher(
@@ -988,6 +906,10 @@ class UNet1d(nn.Module):
                     use_pre_downsample=True,
                     use_skip=True,
                     num_transformer_blocks=attentions[i],
+                    attention_use_positional_embedding=(
+                        attentions[i] > 0 and exists(length)
+                    ),
+                    attention_max_length=layer_lengths[i + 1],
                     **attention_kwargs,
                 )
                 for i in range(num_layers)
@@ -1000,6 +922,8 @@ class UNet1d(nn.Module):
             context_embedding_features=context_embedding_features,
             num_groups=resnet_groups,
             num_transformer_blocks=attentions[-1],
+            attention_use_positional_embedding=attentions[-1] > 0 and exists(length),
+            attention_max_length=layer_lengths[-1],
             **attention_kwargs,
         )
 
@@ -1019,6 +943,10 @@ class UNet1d(nn.Module):
                     use_skip=True,
                     skip_channels=channels * multipliers[i + 1],
                     num_transformer_blocks=attentions[i],
+                    attention_use_positional_embedding=(
+                        attentions[i] > 0 and exists(length)
+                    ),
+                    attention_max_length=layer_lengths[i + 1],
                     **attention_kwargs,
                 )
                 for i in reversed(range(num_layers))
@@ -1050,8 +978,6 @@ class UNet1d(nn.Module):
         num_channels = self.context_channels[layer]
         message = f"Expected context with {num_channels} channels at idx {channels_id}"
         assert channels.shape[1] == num_channels, message
-        # STFT channels if requested
-        channels = self.stft.encode1d(channels) if self.use_stft_context else channels  # type: ignore # noqa
         return channels
 
     def get_mapping(
@@ -1085,8 +1011,6 @@ class UNet1d(nn.Module):
         embedding: Optional[Tensor] = None,
     ) -> Tensor:
         channels = self.get_channels(channels_list, layer=0)
-        # Apply stft if required
-        x = self.stft.encode1d(x) if self.use_stft else x  # type: ignore
         # Concat context channels at layer 0 if provided
         x = torch.cat([x, channels], dim=1) if exists(channels) else x
         # Compute mapping from time and features
@@ -1109,28 +1033,10 @@ class UNet1d(nn.Module):
 
         x += skips_list.pop()
         x = self.to_out(x, mapping)
-        x = self.stft.decode1d(x) if self.use_stft else x
-
         return x
 
 
 """ Conditioning Modules """
-
-
-class FixedEmbedding(nn.Module):
-    def __init__(self, max_length: int, features: int):
-        super().__init__()
-        self.max_length = max_length
-        self.embedding = nn.Embedding(max_length, features)
-
-    def forward(self, x: Tensor) -> Tensor:
-        batch_size, length, device = *x.shape[0:2], x.device
-        assert_message = "Input sequence length must be <= max_length"
-        assert length <= self.max_length, assert_message
-        position = torch.arange(length, device=device)
-        fixed_embedding = self.embedding(position)
-        fixed_embedding = repeat(fixed_embedding, "n d -> b n d", b=batch_size)
-        return fixed_embedding
 
 
 def rand_bool(shape: Any, proba: float, device: Any = None) -> Tensor:
@@ -1189,73 +1095,11 @@ class UNetCFG1d(UNet1d):
             return super().forward(x, time, embedding=embedding, **kwargs)
 
 
-class UNetNCCA1d(UNet1d):
-
-    """UNet1d with Noise Channel Conditioning Augmentation"""
-
-    def __init__(self, context_features: int, **kwargs):
-        super().__init__(context_features=context_features, **kwargs)
-        self.embedder = NumberEmbedder(features=context_features)
-
-    def expand(self, x: Any, shape: Tuple[int, ...]) -> Tensor:
-        x = x if torch.is_tensor(x) else torch.tensor(x)
-        return x.expand(shape)
-
-    def forward(  # type: ignore
-        self,
-        x: Tensor,
-        time: Tensor,
-        *,
-        channels_list: Sequence[Tensor],
-        channels_augmentation: Union[
-            bool, Sequence[bool], Sequence[Sequence[bool]], Tensor
-        ] = False,
-        channels_scale: Union[
-            float, Sequence[float], Sequence[Sequence[float]], Tensor
-        ] = 0,
-        **kwargs,
-    ) -> Tensor:
-        b, n = x.shape[0], len(channels_list)
-        channels_augmentation = self.expand(channels_augmentation, shape=(b, n)).to(x)
-        channels_scale = self.expand(channels_scale, shape=(b, n)).to(x)
-
-        # Augmentation (for each channel list item)
-        for i in range(n):
-            scale = channels_scale[:, i] * channels_augmentation[:, i]
-            scale = rearrange(scale, "b -> b 1 1")
-            item = channels_list[i]
-            channels_list[i] = torch.randn_like(item) * scale + item * (1 - scale)  # type: ignore # noqa
-
-        # Scale embedding (sum reduction if more than one channel list item)
-        channels_scale_emb = self.embedder(channels_scale)
-        channels_scale_emb = reduce(channels_scale_emb, "b n d -> b d", "sum")
-
-        return super().forward(
-            x=x,
-            time=time,
-            channels_list=channels_list,
-            features=channels_scale_emb,
-            **kwargs,
-        )
-
-
-class UNetAll1d(UNetCFG1d, UNetNCCA1d):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def forward(self, *args, **kwargs):  # type: ignore
-        return UNetCFG1d.forward(self, *args, **kwargs)
-
-
 def XUNet1d(type: str = "base", **kwargs) -> UNet1d:
     if type == "base":
         return UNet1d(**kwargs)
-    elif type == "all":
-        return UNetAll1d(**kwargs)
     elif type == "cfg":
         return UNetCFG1d(**kwargs)
-    elif type == "ncca":
-        return UNetNCCA1d(**kwargs)
     else:
         raise ValueError(f"Unknown XUNet1d type: {type}")
 
