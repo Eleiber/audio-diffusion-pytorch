@@ -5,7 +5,7 @@ Experimental branch for autoregressive diffusion.
 ## Install
 
 ```bash
-pip install audio-diffusion-pytorch
+pip install -U git+https://github.com/archinetai/audio-diffusion-pytorch.git@ar
 ```
 
 
@@ -13,5 +13,5 @@ pip install audio-diffusion-pytorch
 
 ### Generation
 ```py
-
+# TODO
 ```
