@@ -1,5 +1,5 @@
 from itertools import accumulate
-from math import floor, log, pi
+from math import log, pi
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -9,7 +9,7 @@ from einops.layers.torch import Rearrange
 from einops_exts import rearrange_many
 from torch import Tensor, einsum
 
-from .utils import closest_power_2, default, exists, groupby, to_list
+from .utils import default, exists, groupby, to_list
 
 """
 Convolutional Blocks
@@ -1158,91 +1158,3 @@ class NumberEmbedder(nn.Module):
         embedding = self.embedding(x)
         x = embedding.view(*shape, self.features)
         return x  # type: ignore
-
-
-"""
-Audio Transforms
-"""
-
-
-class STFT(nn.Module):
-    """Helper for torch stft and istft"""
-
-    def __init__(
-        self,
-        num_fft: int = 1023,
-        hop_length: int = 256,
-        window_length: Optional[int] = None,
-        length: Optional[int] = None,
-        use_complex: bool = False,
-    ):
-        super().__init__()
-        self.num_fft = num_fft
-        self.hop_length = default(hop_length, floor(num_fft // 4))
-        self.window_length = default(window_length, num_fft)
-        self.length = length
-        self.register_buffer("window", torch.hann_window(self.window_length))
-        self.use_complex = use_complex
-
-    def encode(self, wave: Tensor) -> Tuple[Tensor, Tensor]:
-        b = wave.shape[0]
-        wave = rearrange(wave, "b c t -> (b c) t")
-
-        stft = torch.stft(
-            wave,
-            n_fft=self.num_fft,
-            hop_length=self.hop_length,
-            win_length=self.window_length,
-            window=self.window,  # type: ignore
-            return_complex=True,
-            normalized=True,
-        )
-
-        if self.use_complex:
-            # Returns real and imaginary
-            stft_a, stft_b = stft.real, stft.imag
-        else:
-            # Returns magnitude and phase matrices
-            magnitude, phase = torch.abs(stft), torch.angle(stft)
-            stft_a, stft_b = magnitude, phase
-
-        return rearrange_many((stft_a, stft_b), "(b c) f l -> b c f l", b=b)
-
-    def decode(self, stft_a: Tensor, stft_b: Tensor) -> Tensor:
-        b, l = stft_a.shape[0], stft_a.shape[-1]  # noqa
-        length = closest_power_2(l * self.hop_length)
-
-        stft_a, stft_b = rearrange_many((stft_a, stft_b), "b c f l -> (b c) f l")
-
-        if self.use_complex:
-            real, imag = stft_a, stft_b
-        else:
-            magnitude, phase = stft_a, stft_b
-            real, imag = magnitude * torch.cos(phase), magnitude * torch.sin(phase)
-
-        stft = torch.stack([real, imag], dim=-1)
-
-        wave = torch.istft(
-            stft,
-            n_fft=self.num_fft,
-            hop_length=self.hop_length,
-            win_length=self.window_length,
-            window=self.window,  # type: ignore
-            length=default(self.length, length),
-            normalized=True,
-        )
-
-        return rearrange(wave, "(b c) t -> b c t", b=b)
-
-    def encode1d(
-        self, wave: Tensor, stacked: bool = True
-    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-        stft_a, stft_b = self.encode(wave)
-        stft_a, stft_b = rearrange_many((stft_a, stft_b), "b c f l -> b (c f) l")
-        return torch.cat((stft_a, stft_b), dim=1) if stacked else (stft_a, stft_b)
-
-    def decode1d(self, stft_pair: Tensor) -> Tensor:
-        f = self.num_fft // 2 + 1
-        stft_a, stft_b = stft_pair.chunk(chunks=2, dim=1)
-        stft_a, stft_b = rearrange_many((stft_a, stft_b), "b (c f) l -> b c f l", f=f)
-        return self.decode(stft_a, stft_b)

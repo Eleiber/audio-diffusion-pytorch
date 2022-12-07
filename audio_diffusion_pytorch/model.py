@@ -77,9 +77,9 @@ class DiffusionAR1d(nn.Module):
         sigmas = torch.linspace(1, 0, s * n, device=self.device)
         sigmas = repeat(sigmas, "(n s) -> s b c (n l)", b=b, c=c, l=l, n=n)
         sigmas = torch.flip(sigmas, dims=[-1])  # Lowest noise level first
+        sigmas = F.pad(sigmas, pad=[0, 0, 0, 0, 0, 0, 0, 1])  # Add index i+1
+        sigmas[-1, :, :, l:] = sigmas[0, :, :, :-l]  # Loop back at index i+1
         alphas, betas = self.get_alpha_beta(sigmas)
-        alphas = torch.cat((alphas, torch.zeros_like(alphas)), dim=0)
-        betas = torch.cat((betas, torch.zeros_like(betas)), dim=0)
 
         # Noise start and set as starting chunks
         start_noisy = alphas[0] * start + betas[0] * torch.randn_like(start)
@@ -117,11 +117,8 @@ class DiffusionAR1d(nn.Module):
         for i in progress_bar:
             v_pred = self.net(x_noisy, channels_list=[sigmas[i]], **kwargs)
             x_pred = alphas[i] * x_noisy - betas[i] * v_pred
-
-            if i < num_steps - 1:  # Compute noisy if not last sampling step
-                noise_pred = betas[i] * x_noisy + alphas[i] * v_pred
-                x_noisy = alphas[i + 1] * x_pred + betas[i + 1] * noise_pred
-
+            noise_pred = betas[i] * x_noisy + alphas[i] * v_pred
+            x_noisy = alphas[i + 1] * x_pred + betas[i + 1] * noise_pred
             progress_bar.set_description(f"Sampling (noise={sigmas[i+1,0,0,0]:.2f})")
 
-        return x_pred
+        return x_noisy
