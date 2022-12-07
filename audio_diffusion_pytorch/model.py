@@ -1,128 +1,127 @@
-from random import randint
-from typing import Optional
+from math import pi
+from typing import Optional, Tuple
 
 import torch
-from einops import rearrange
-from torch import Tensor, nn
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import repeat
+from torch import Tensor
 from tqdm import tqdm
 
-from .diffusion import XDiffusion
-from .modules import XUNet1d, rand_bool
-from .utils import downsample, exists, groupby, upsample
-
-"""
-Diffusion Classes (generic for 1d data)
-"""
+from .modules import XUNet1d
+from .utils import default
 
 
-class Model1d(nn.Module):
-    def __init__(self, unet_type: str = "base", **kwargs):
-        super().__init__()
-        diffusion_kwargs, kwargs = groupby("diffusion_", kwargs)
-        self.unet = XUNet1d(type=unet_type, **kwargs)
-        self.diffusion = XDiffusion(net=self.unet, **diffusion_kwargs)
-
-    def forward(self, x: Tensor, **kwargs) -> Tensor:
-        return self.diffusion(x, **kwargs)
-
-    def sample(self, *args, **kwargs) -> Tensor:
-        return self.diffusion.sample(*args, **kwargs)
-
-
-class DiffusionAR1d(Model1d):
+class DiffusionAR1d(nn.Module):
     def __init__(
-        self,
-        in_channels: int,
-        chunk_length: int,
-        upsample: int = 0,
-        dropout: float = 0.05,
-        verbose: int = 0,
-        **kwargs,
+        self, unet_type: str, in_channels: int, length: int, num_splits: int, **kwargs
     ):
+        super().__init__()
+        assert length % num_splits == 0, "length must be divisible by num_splits"
+        self.length = length
         self.in_channels = in_channels
-        self.chunk_length = chunk_length
-        self.dropout = dropout
-        self.upsample = upsample
-        self.verbose = verbose
-        super().__init__(
+        self.num_splits = num_splits
+        self.split_length = length // num_splits
+
+        self.net = XUNet1d(
+            type=unet_type,
             in_channels=in_channels,
-            context_channels=[in_channels * (2 if upsample > 0 else 1)],
+            context_channels=[in_channels],
+            length=length,
             **kwargs,
         )
 
-    def reupsample(self, x: Tensor) -> Tensor:
-        x = x.clone()
-        x = downsample(x, factor=self.upsample)
-        x = upsample(x, factor=self.upsample)
-        return x
+    @property
+    def device(self):
+        return next(self.net.parameters()).device
+
+    def get_alpha_beta(self, sigmas: Tensor) -> Tuple[Tensor, Tensor]:
+        angle = sigmas * pi / 2
+        alpha = torch.cos(angle)
+        beta = torch.sin(angle)
+        return alpha, beta
 
     def forward(self, x: Tensor, **kwargs) -> Tensor:
-        b, _, t, device = *x.shape, x.device
-        cl, num_chunks = self.chunk_length, t // self.chunk_length
-        assert num_chunks >= 2, "Input tensor length must be >= chunk_length * 2"
+        """Returns diffusion loss of v-objective with different noises per split"""
+        b, c, t, device, dtype = *x.shape, x.device, x.dtype
+        assert t == self.length, "input length must match length"
+        # Sample amount of noise to add for each split
+        sigmas = torch.rand((b, c, self.num_splits), device=device, dtype=dtype)
+        sigmas = repeat(sigmas, "b c n -> b c (n l)", l=self.split_length)
+        # Get noise
+        noise = torch.randn_like(x)
+        # Combine input and noise weighted by half-circle
+        alphas, betas = self.get_alpha_beta(sigmas)
+        x_noisy = alphas * x + betas * noise
+        v_target = alphas * noise - betas * x
+        # Denoise and return loss
+        v_pred = self.net(x_noisy, channels_list=[sigmas], **kwargs)
+        return F.mse_loss(v_pred, v_target)
 
-        # Get prev and current target chunks
-        chunk_index = randint(0, num_chunks - 2)
-        chunk_pos = cl * (chunk_index + 1)
-        chunk_prev = x[:, :, cl * chunk_index : chunk_pos]
-        chunk_curr = x[:, :, chunk_pos : cl * (chunk_index + 2)]
+    def sample(
+        self,
+        num_chunks: int,
+        num_items: int,
+        num_steps: int,
+        start: Optional[Tensor] = None,
+        show_progress: bool = False,
+        **kwargs,
+    ) -> Tensor:
+        """Samples autoregressively `num_chunks` splits"""
+        b, c, t, n = num_items, self.in_channels, self.length, self.num_splits
+        start = default(start, lambda: self.sample_all(num_items, num_steps, **kwargs))
+        assert start.shape == (b, c, t), "start has wrong shape"
+        assert num_steps >= n, "num_steps must be greater than num_splits"
 
-        # Randomly dropout source chunks to allow for zero AR start
-        if self.dropout > 0:
-            batch_mask = rand_bool(shape=(b, 1, 1), proba=self.dropout, device=device)
-            chunk_zeros = torch.zeros_like(chunk_prev)
-            chunk_prev = torch.where(batch_mask, chunk_zeros, chunk_prev)
+        s, l = num_steps // self.num_splits, self.split_length  # noqa
+        sigmas = torch.linspace(1, 0, s * n, device=self.device)
+        sigmas = repeat(sigmas, "(n s) -> s b c (n l)", b=b, c=c, l=l, n=n)
+        sigmas = torch.flip(sigmas, dims=[-1])  # Lowest noise level first
+        alphas, betas = self.get_alpha_beta(sigmas)
+        alphas = torch.cat((alphas, torch.zeros_like(alphas)), dim=0)
+        betas = torch.cat((betas, torch.zeros_like(betas)), dim=0)
 
-        # Condition on previous chunk and reupsampled current if required
-        if self.upsample > 0:
-            chunk_reupsampled = self.reupsample(chunk_curr)
-            channels_list = [torch.cat([chunk_prev, chunk_reupsampled], dim=1)]
-        else:
-            channels_list = [chunk_prev]
+        # Noise start and set as starting chunks
+        start_noisy = alphas[0] * start + betas[0] * torch.randn_like(start)
+        chunks = list(start_noisy.chunk(chunks=n, dim=-1))
 
-        # Diffuse current current chunk
-        return self.diffusion(chunk_curr, channels_list=channels_list, **kwargs)
+        progress_bar = tqdm(range(num_chunks), disable=not show_progress)
+        for _ in progress_bar:
+            # Get last n chunks
+            x_noisy = torch.cat(chunks[-n:], dim=-1)
+            # Decrease noise by one level
+            for i in range(s):
+                v_pred = self.net(x_noisy, channels_list=[sigmas[i]], **kwargs)
+                x_pred = alphas[i] * x_noisy - betas[i] * v_pred
+                noise_pred = betas[i] * x_noisy + alphas[i] * v_pred
+                x_noisy = alphas[i + 1] * x_pred + betas[i + 1] * noise_pred
 
-    def sample(self, x: Tensor, start: Optional[Tensor] = None, **kwargs) -> Tensor:  # type: ignore # noqa
-        noise = x
+            # Update chunks
+            chunks[-n:] = list(x_noisy.chunk(chunks=n, dim=-1))
+            # Add fresh noise chunk
+            chunks += [torch.randn((b, c, l), device=self.device)]
 
-        if self.upsample > 0:
-            # In this case we assume that x is the downsampled audio instead of noise
-            upsampled = upsample(x, factor=self.upsample)
-            noise = torch.randn_like(upsampled)
+        return torch.cat(chunks[:-n], dim=-1)
 
-        b, c, t, device = *noise.shape, noise.device
-        cl, num_chunks = self.chunk_length, t // self.chunk_length
-        assert c == self.in_channels
-        assert t % cl == 0, "noise must be divisible by chunk_length"
+    def sample_all(
+        self, num_items: int, num_steps: int, show_progress: bool = False, **kwargs
+    ) -> Tensor:
+        """Samples a single block of length `length` in one go"""
+        b, c, t = num_items, self.in_channels, self.length
+        sigmas = torch.linspace(1, 0, num_steps + 1, device=self.device)
+        sigmas = repeat(sigmas, "i -> i b c t", b=b, c=c, t=t)
+        alphas, betas = self.get_alpha_beta(sigmas)
+        x_noisy = torch.randn((b, c, t), device=self.device) * sigmas[0]
+        progress_bar = tqdm(range(num_steps), disable=not show_progress)
 
-        # Initialize previous chunk
-        if exists(start):
-            chunk_prev = start[:, :, -cl:]
-        else:
-            chunk_prev = torch.zeros(b, c, cl).to(device)
+        for i in progress_bar:
+            v_pred = self.net(x_noisy, channels_list=[sigmas[i]], **kwargs)
+            x_pred = alphas[i] * x_noisy - betas[i] * v_pred
 
-        # Computed chunks
-        chunks = []
+            if i < num_steps - 1:  # Compute noisy if not last sampling step
+                noise_pred = betas[i] * x_noisy + alphas[i] * v_pred
+                x_noisy = alphas[i + 1] * x_pred + betas[i + 1] * noise_pred
 
-        for i in tqdm(range(num_chunks), disable=(self.verbose == 0)):
-            # Chunk noise
-            chunk_start, chunk_end = cl * i, cl * (i + 1)
-            noise_curr = noise[:, :, chunk_start:chunk_end]
+            progress_bar.set_description(f"Sampling (noise={sigmas[i+1,0,0,0]:.2f})")
 
-            # Condition on previous chunk and artifically upsampled current if required
-            if self.upsample > 0:
-                chunk_upsampled = upsampled[:, :, chunk_start:chunk_end]
-                channels_list = [torch.cat([chunk_prev, chunk_upsampled], dim=1)]
-            else:
-                channels_list = [chunk_prev]
-            default_kwargs = dict(channels_list=channels_list)
-
-            # Sample current chunk
-            chunk_curr = super().sample(noise_curr, **{**default_kwargs, **kwargs})
-
-            # Save chunk and use current as prev
-            chunks += [chunk_curr]
-            chunk_prev = chunk_curr
-
-        return rearrange(chunks, "l b c t -> b c (l t)")
+        return x_pred

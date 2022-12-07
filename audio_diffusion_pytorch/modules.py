@@ -1068,13 +1068,14 @@ class UNetCFG1d(UNet1d):
     def forward(  # type: ignore
         self,
         x: Tensor,
-        time: Tensor,
+        time: Optional[Tensor] = None,
         *,
-        embedding: Tensor,
+        embedding: Optional[Tensor] = None,
         embedding_scale: float = 1.0,
         embedding_mask_proba: float = 0.0,
         **kwargs,
     ) -> Tensor:
+        assert exists(embedding), "embedding required when using CFG"
         b, device = embedding.shape[0], embedding.device
         fixed_embedding = self.fixed_embedding(embedding)
 
