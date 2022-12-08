@@ -4,6 +4,7 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from einops_exts import rearrange_many
@@ -20,52 +21,29 @@ def Conv1d(*args, **kwargs) -> nn.Module:
     return nn.Conv1d(*args, **kwargs)
 
 
-def ConvTranspose1d(*args, **kwargs) -> nn.Module:
-    return nn.ConvTranspose1d(*args, **kwargs)
+class Conv1dNoPad(nn.Module):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.conv = Conv1d(padding=0, **kwargs)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.interpolate(self.conv(x), size=x.shape[-1], mode="linear")
 
 
-def Downsample1d(
-    in_channels: int, out_channels: int, factor: int, kernel_multiplier: int = 2
-) -> nn.Module:
-    assert kernel_multiplier % 2 == 0, "Kernel multiplier must be even"
-
+def Downsample1d(in_channels: int, out_channels: int, factor: int) -> nn.Module:
     return Conv1d(
         in_channels=in_channels,
         out_channels=out_channels,
-        kernel_size=factor * kernel_multiplier + 1,
+        kernel_size=factor,
         stride=factor,
-        padding=factor * (kernel_multiplier // 2),
     )
 
 
-def Upsample1d(
-    in_channels: int, out_channels: int, factor: int, use_nearest: bool = False
-) -> nn.Module:
-
-    if factor == 1:
-        return Conv1d(
-            in_channels=in_channels, out_channels=out_channels, kernel_size=3, padding=1
-        )
-
-    if use_nearest:
-        return nn.Sequential(
-            nn.Upsample(scale_factor=factor, mode="nearest"),
-            Conv1d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=3,
-                padding=1,
-            ),
-        )
-    else:
-        return ConvTranspose1d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=factor * 2,
-            stride=factor,
-            padding=factor // 2 + factor % 2,
-            output_padding=factor % 2,
-        )
+def Upsample1d(in_channels: int, out_channels: int, factor: int) -> nn.Module:
+    return nn.Sequential(
+        nn.Upsample(scale_factor=factor, mode="nearest"),
+        Conv1dNoPad(in_channels=in_channels, out_channels=out_channels, kernel_size=3),
+    )
 
 
 class ConvBlock1d(nn.Module):
@@ -76,7 +54,6 @@ class ConvBlock1d(nn.Module):
         *,
         kernel_size: int = 3,
         stride: int = 1,
-        padding: int = 1,
         dilation: int = 1,
         num_groups: int = 8,
         use_norm: bool = True,
@@ -89,12 +66,11 @@ class ConvBlock1d(nn.Module):
             else nn.Identity()
         )
         self.activation = nn.SiLU()
-        self.project = Conv1d(
+        self.project = Conv1dNoPad(
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
             stride=stride,
-            padding=padding,
             dilation=dilation,
         )
 
@@ -137,7 +113,6 @@ class ResnetBlock1d(nn.Module):
         *,
         kernel_size: int = 3,
         stride: int = 1,
-        padding: int = 1,
         dilation: int = 1,
         use_norm: bool = True,
         num_groups: int = 8,
@@ -152,7 +127,6 @@ class ResnetBlock1d(nn.Module):
             out_channels=out_channels,
             kernel_size=kernel_size,
             stride=stride,
-            padding=padding,
             dilation=dilation,
             use_norm=use_norm,
             num_groups=num_groups,
@@ -511,7 +485,6 @@ class DownsampleBlock1d(nn.Module):
         factor: int,
         num_groups: int,
         num_layers: int,
-        kernel_multiplier: int = 2,
         use_pre_downsample: bool = True,
         use_skip: bool = False,
         extract_channels: int = 0,
@@ -535,10 +508,7 @@ class DownsampleBlock1d(nn.Module):
         channels = out_channels if use_pre_downsample else in_channels
 
         self.downsample = Downsample1d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            factor=factor,
-            kernel_multiplier=kernel_multiplier,
+            in_channels=in_channels, out_channels=out_channels, factor=factor
         )
 
         self.blocks = nn.ModuleList(
@@ -621,7 +591,6 @@ class UpsampleBlock1d(nn.Module):
         factor: int,
         num_layers: int,
         num_groups: int,
-        use_nearest: bool = False,
         use_pre_upsample: bool = False,
         use_skip: bool = False,
         skip_channels: int = 0,
@@ -679,7 +648,6 @@ class UpsampleBlock1d(nn.Module):
             in_channels=in_channels,
             out_channels=out_channels,
             factor=factor,
-            use_nearest=use_nearest,
         )
 
         if self.use_extract:
@@ -802,8 +770,6 @@ class UNet1d(nn.Module):
         patch_size: int = 1,
         resnet_groups: int = 8,
         use_context_time: bool = True,
-        kernel_multiplier_downsample: int = 2,
-        use_nearest_upsample: bool = False,
         use_skip_scale: bool = True,
         out_channels: Optional[int] = None,
         context_features: Optional[int] = None,
@@ -901,7 +867,6 @@ class UNet1d(nn.Module):
                     context_embedding_features=context_embedding_features,
                     num_layers=num_blocks[i],
                     factor=factors[i],
-                    kernel_multiplier=kernel_multiplier_downsample,
                     num_groups=resnet_groups,
                     use_pre_downsample=True,
                     use_skip=True,
@@ -936,7 +901,6 @@ class UNet1d(nn.Module):
                     context_embedding_features=context_embedding_features,
                     num_layers=num_blocks[i] + (1 if attentions[i] else 0),
                     factor=factors[i],
-                    use_nearest=use_nearest_upsample,
                     num_groups=resnet_groups,
                     use_skip_scale=use_skip_scale,
                     use_pre_upsample=False,
