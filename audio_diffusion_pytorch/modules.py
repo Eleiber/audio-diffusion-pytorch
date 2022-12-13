@@ -1,6 +1,6 @@
 from itertools import accumulate
-from math import log, pi
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from math import floor, log, pi
+from typing import Any, List, Optional, Sequence, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -10,7 +10,7 @@ from einops.layers.torch import Rearrange
 from einops_exts import rearrange_many
 from torch import Tensor, einsum
 
-from .utils import default, exists, groupby, to_list
+from .utils import closest_power_2, default, exists, groupby, to_list
 
 """
 Convolutional Blocks
@@ -19,15 +19,6 @@ Convolutional Blocks
 
 def Conv1d(*args, **kwargs) -> nn.Module:
     return nn.Conv1d(*args, **kwargs)
-
-
-class Conv1dNoPad(nn.Module):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.conv = Conv1d(padding=0, **kwargs)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return F.interpolate(self.conv(x), size=x.shape[-1], mode="linear")
 
 
 def Downsample1d(in_channels: int, out_channels: int, factor: int) -> nn.Module:
@@ -42,7 +33,9 @@ def Downsample1d(in_channels: int, out_channels: int, factor: int) -> nn.Module:
 def Upsample1d(in_channels: int, out_channels: int, factor: int) -> nn.Module:
     return nn.Sequential(
         nn.Upsample(scale_factor=factor, mode="nearest"),
-        Conv1dNoPad(in_channels=in_channels, out_channels=out_channels, kernel_size=3),
+        Conv1d(
+            in_channels=in_channels, out_channels=out_channels, kernel_size=3, padding=1
+        ),
     )
 
 
@@ -55,6 +48,7 @@ class ConvBlock1d(nn.Module):
         kernel_size: int = 3,
         stride: int = 1,
         dilation: int = 1,
+        padding: int = 1,
         num_groups: int = 8,
         use_norm: bool = True,
     ) -> None:
@@ -66,12 +60,13 @@ class ConvBlock1d(nn.Module):
             else nn.Identity()
         )
         self.activation = nn.SiLU()
-        self.project = Conv1dNoPad(
+        self.project = Conv1d(
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
             stride=stride,
             dilation=dilation,
+            padding=padding,
         )
 
     def forward(
@@ -1012,61 +1007,340 @@ def rand_bool(shape: Any, proba: float, device: Any = None) -> Tensor:
         return torch.bernoulli(torch.full(shape, proba, device=device)).to(torch.bool)
 
 
-class UNetCFG1d(UNet1d):
-
+def UNetCFG1dType(
+    context_embedding_max_length: int,
+    context_embedding_features: int,
+    type: Type[UNet1d] = UNet1d,
+) -> Type[UNet1d]:
     """UNet1d with Classifier-Free Guidance"""
+
+    class UNetCFG1d(type):  # type: ignore
+        def __init__(self, **kwargs):
+            super().__init__(
+                context_embedding_features=context_embedding_features, **kwargs
+            )
+            self.fixed_embedding = FixedEmbedding(
+                max_length=context_embedding_max_length,
+                features=context_embedding_features,
+            )
+
+        def forward(  # type: ignore
+            self,
+            x: Tensor,
+            time: Optional[Tensor] = None,
+            *,
+            embedding: Optional[Tensor] = None,
+            embedding_scale: float = 1.0,
+            embedding_mask_proba: float = 0.0,
+            **kwargs,
+        ) -> Tensor:
+            assert exists(embedding), "embedding required when using CFG"
+            b, device = embedding.shape[0], embedding.device
+            fixed_embedding = self.fixed_embedding(embedding)
+
+            if embedding_mask_proba > 0.0:
+                # Randomly mask embedding
+                batch_mask = rand_bool(
+                    shape=(b, 1, 1), proba=embedding_mask_proba, device=device
+                )
+                embedding = torch.where(batch_mask, fixed_embedding, embedding)
+
+            if embedding_scale != 1.0:
+                # Compute both normal and fixed embedding outputs
+                out = super().forward(x, time, embedding=embedding, **kwargs)
+                out_masked = super().forward(
+                    x, time, embedding=fixed_embedding, **kwargs
+                )
+                # Scale conditional output using classifier-free guidance
+                return out_masked + (out - out_masked) * embedding_scale
+            else:
+                return super().forward(x, time, embedding=embedding, **kwargs)
+
+    return UNetCFG1d
+
+
+def UNetCQT1dType(
+    num_octaves: int,
+    num_bins_per_octave: int,
+    power_of_2_length: bool = True,
+    use_on_context: bool = True,
+    type: Type[UNet1d] = UNet1d,
+    **transform_kwargs,
+) -> Type[UNet1d]:
+    class UNetCQT1d(type):  # type: ignore
+        def __init__(
+            self,
+            in_channels: int,
+            length: int,
+            context_channels: Optional[Sequence[int]] = None,
+            **kwargs,
+        ):
+            from cqt_pytorch import CQT
+
+            transform = CQT(
+                num_octaves=num_octaves,
+                num_bins_per_octave=num_bins_per_octave,
+                power_of_2_length=power_of_2_length,
+                **transform_kwargs,
+            )
+            self.in_channels = in_channels
+
+            if use_on_context and exists(context_channels) and context_channels[0] > 0:
+                context_channels[0] *= num_octaves * num_bins_per_octave * 2  # type: ignore # noqa
+
+            super().__init__(
+                in_channels=in_channels * num_octaves * num_bins_per_octave * 2,
+                length=length // transform.block_length * transform.max_window_length,
+                context_channels=context_channels,
+                **kwargs,
+            )
+            self.transform = transform
+
+        def encode(self, x: Tensor) -> Tensor:
+            x = torch.view_as_real(self.transform.encode(x))
+            x = rearrange(x, "b c k l i -> b (c k i) l")
+            return x
+
+        def decode(self, x: Tensor) -> Tensor:
+            x = rearrange(x, "b (c k i) l -> b c k l i", c=self.in_channels, i=2)
+            x = self.transform.decode(torch.view_as_complex(x.contiguous()))
+            return x
+
+        def forward(
+            self,
+            x: Tensor,
+            *args,
+            channels_list: Optional[Sequence[Tensor]] = None,
+            **kwargs,
+        ) -> Tensor:
+            if use_on_context and exists(channels_list) and len(channels_list) > 0:
+                channels_list[0] = self.encode(channels_list[0])  # type: ignore # noqa
+            x = self.encode(x)
+            y = super().forward(x, *args, channels_list=channels_list, **kwargs)
+            y = self.decode(y)
+            return y
+
+    return UNetCQT1d
+
+
+class LT(nn.Module):
+    """Learned Transform"""
 
     def __init__(
         self,
-        context_embedding_max_length: int,
-        context_embedding_features: int,
-        **kwargs,
+        num_channels: int,
+        num_filters: int,
+        window_length: int,
+        stride: int,
     ):
-        super().__init__(
-            context_embedding_features=context_embedding_features, **kwargs
-        )
-        self.fixed_embedding = FixedEmbedding(
-            max_length=context_embedding_max_length, features=context_embedding_features
+        super().__init__()
+        self.stride = stride
+
+        self.conv = nn.Conv1d(
+            in_channels=num_channels,
+            out_channels=num_filters,
+            kernel_size=window_length,
+            stride=stride,
+            padding=0,
+            bias=False,
         )
 
-    def forward(  # type: ignore
-        self,
-        x: Tensor,
-        time: Optional[Tensor] = None,
-        *,
-        embedding: Optional[Tensor] = None,
-        embedding_scale: float = 1.0,
-        embedding_mask_proba: float = 0.0,
-        **kwargs,
-    ) -> Tensor:
-        assert exists(embedding), "embedding required when using CFG"
-        b, device = embedding.shape[0], embedding.device
-        fixed_embedding = self.fixed_embedding(embedding)
+    def encode(self, x: Tensor) -> Tensor:
+        return self.conv(x)
 
-        if embedding_mask_proba > 0.0:
-            # Randomly mask embedding
-            batch_mask = rand_bool(
-                shape=(b, 1, 1), proba=embedding_mask_proba, device=device
+    def decode(self, x: Tensor) -> Tensor:
+        return F.conv_transpose1d(input=x, weight=self.conv.weight, stride=self.stride)
+
+
+def UNetLT1dType(
+    num_filters: int,
+    window_length: int,
+    use_on_context: bool = True,
+    type: Type[UNet1d] = UNet1d,
+    **transform_kwargs,
+) -> Type[UNet1d]:
+    class UNetLT1d(type):  # type: ignore
+        def __init__(
+            self,
+            in_channels: int,
+            length: int,
+            context_channels: Optional[Sequence[int]] = None,
+            **kwargs,
+        ):
+            transform = LT(
+                num_channels=in_channels,
+                num_filters=num_filters,
+                window_length=window_length,
+                stride=window_length,
+                **transform_kwargs,
             )
-            embedding = torch.where(batch_mask, fixed_embedding, embedding)
 
-        if embedding_scale != 1.0:
-            # Compute both normal and fixed embedding outputs
-            out = super().forward(x, time, embedding=embedding, **kwargs)
-            out_masked = super().forward(x, time, embedding=fixed_embedding, **kwargs)
-            # Scale conditional output using classifier-free guidance
-            return out_masked + (out - out_masked) * embedding_scale
+            if use_on_context and exists(context_channels) and context_channels[0] > 0:
+                assert context_channels[0] == in_channels
+                context_channels[0] = num_filters  # type: ignore # noqa
+
+            super().__init__(
+                in_channels=num_filters,
+                length=length // window_length,
+                context_channels=context_channels,
+                **kwargs,
+            )
+            self.transform = transform
+
+        def forward(
+            self,
+            x: Tensor,
+            *args,
+            channels_list: Optional[Sequence[Tensor]] = None,
+            **kwargs,
+        ) -> Tensor:
+            if use_on_context and exists(channels_list) and len(channels_list) > 0:
+                channels_list[0] = self.transform.encode(channels_list[0])  # type: ignore # noqa
+            x = self.transform.encode(x)
+            y = super().forward(x, *args, channels_list=channels_list, **kwargs)
+            y = self.transform.decode(y)
+            return y
+
+    return UNetLT1d
+
+
+class STFT(nn.Module):
+    """Helper for torch stft and istft"""
+
+    def __init__(
+        self,
+        num_fft: int = 1023,
+        hop_length: int = 256,
+        window_length: Optional[int] = None,
+        length: Optional[int] = None,
+        use_complex: bool = False,
+    ):
+        super().__init__()
+        self.num_fft = num_fft
+        self.hop_length = default(hop_length, floor(num_fft // 4))
+        self.window_length = default(window_length, num_fft)
+        self.length = length
+        self.register_buffer("window", torch.hann_window(self.window_length))
+        self.use_complex = use_complex
+
+    def encode(self, wave: Tensor) -> Tuple[Tensor, Tensor]:
+        b = wave.shape[0]
+        wave = rearrange(wave, "b c t -> (b c) t")
+
+        stft = torch.stft(
+            wave,
+            n_fft=self.num_fft,
+            hop_length=self.hop_length,
+            win_length=self.window_length,
+            window=self.window,  # type: ignore
+            return_complex=True,
+            normalized=True,
+        )
+
+        if self.use_complex:
+            # Returns real and imaginary
+            stft_a, stft_b = stft.real, stft.imag
         else:
-            return super().forward(x, time, embedding=embedding, **kwargs)
+            # Returns magnitude and phase matrices
+            magnitude, phase = torch.abs(stft), torch.angle(stft)
+            stft_a, stft_b = magnitude, phase
+
+        return rearrange_many((stft_a, stft_b), "(b c) f l -> b c f l", b=b)
+
+    def decode(self, stft_a: Tensor, stft_b: Tensor) -> Tensor:
+        b, l = stft_a.shape[0], stft_a.shape[-1]  # noqa
+        length = closest_power_2(l * self.hop_length)
+
+        stft_a, stft_b = rearrange_many((stft_a, stft_b), "b c f l -> (b c) f l")
+
+        if self.use_complex:
+            real, imag = stft_a, stft_b
+        else:
+            magnitude, phase = stft_a, stft_b
+            real, imag = magnitude * torch.cos(phase), magnitude * torch.sin(phase)
+
+        stft = torch.stack([real, imag], dim=-1)
+
+        wave = torch.istft(
+            stft,
+            n_fft=self.num_fft,
+            hop_length=self.hop_length,
+            win_length=self.window_length,
+            window=self.window,  # type: ignore
+            length=default(self.length, length),
+            normalized=True,
+        )
+
+        return rearrange(wave, "(b c) t -> b c t", b=b)
+
+    def encode1d(
+        self, wave: Tensor, stacked: bool = True
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        stft_a, stft_b = self.encode(wave)
+        stft_a, stft_b = rearrange_many((stft_a, stft_b), "b c f l -> b (c f) l")
+        return torch.cat((stft_a, stft_b), dim=1) if stacked else (stft_a, stft_b)
+
+    def decode1d(self, stft_pair: Tensor) -> Tensor:
+        f = self.num_fft // 2 + 1
+        stft_a, stft_b = stft_pair.chunk(chunks=2, dim=1)
+        stft_a, stft_b = rearrange_many((stft_a, stft_b), "b (c f) l -> b c f l", f=f)
+        return self.decode(stft_a, stft_b)
 
 
-def XUNet1d(type: str = "base", **kwargs) -> UNet1d:
-    if type == "base":
-        return UNet1d(**kwargs)
-    elif type == "cfg":
-        return UNetCFG1d(**kwargs)
-    else:
-        raise ValueError(f"Unknown XUNet1d type: {type}")
+def UNetSTFT1dType(
+    num_fft: int,
+    hop_length: int,
+    use_on_context: bool = True,
+    type: Type[UNet1d] = UNet1d,
+    **transform_kwargs,
+) -> Type[UNet1d]:
+    class UNetSTFT1d(type):  # type: ignore
+        def __init__(
+            self,
+            in_channels: int,
+            length: int,
+            context_channels: Optional[Sequence[int]] = None,
+            **kwargs,
+        ):
+            transform = STFT(num_fft=num_fft, hop_length=hop_length, **transform_kwargs)
+            transform_channels = (num_fft // 2 + 1) * 2
+            if use_on_context and exists(context_channels) and context_channels[0] > 0:
+                context_channels[0] *= transform_channels  # type: ignore # noqa
+
+            super().__init__(
+                in_channels=in_channels * transform_channels,
+                length=length // hop_length,
+                context_channels=context_channels,
+                **kwargs,
+            )
+            self.transform = transform
+
+        def forward(
+            self,
+            x: Tensor,
+            *args,
+            channels_list: Optional[Sequence[Tensor]] = None,
+            **kwargs,
+        ) -> Tensor:
+            if use_on_context and exists(channels_list) and len(channels_list) > 0:
+                channels_list[0] = self.transform.encode1d(channels_list[0])  # type: ignore # noqa
+            x = self.transform.encode1d(x)  # type: ignore
+            y = super().forward(x, *args, channels_list=channels_list, **kwargs)
+            y = self.transform.decode1d(y)
+            return y
+
+    return UNetSTFT1d
+
+
+def XUNet1dType(types: Tuple[Type[UNet1d]]) -> Type[UNet1d]:
+    class XUNet1d(types):  # type: ignore
+        pass
+
+    return XUNet1d
+
+
+def XUNet1d(*types: Tuple[Type[UNet1d]], **kwargs) -> UNet1d:
+    return XUNet1dType(*types)(**kwargs)
 
 
 class T5Embedder(nn.Module):
