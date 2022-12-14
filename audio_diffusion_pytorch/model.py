@@ -30,7 +30,7 @@ class DiffusionAR1d(nn.Module):
 
         self.net = unet_type(
             in_channels=in_channels,
-            context_channels=[in_channels],
+            context_channels=[1],
             length=length,
             **kwargs,
         )
@@ -47,11 +47,11 @@ class DiffusionAR1d(nn.Module):
 
     def forward(self, x: Tensor, **kwargs) -> Tensor:
         """Returns diffusion loss of v-objective with different noises per split"""
-        b, c, t, device, dtype = *x.shape, x.device, x.dtype
+        b, _, t, device, dtype = *x.shape, x.device, x.dtype
         assert t == self.length, "input length must match length"
         # Sample amount of noise to add for each split
-        sigmas = torch.rand((b, c, self.num_splits), device=device, dtype=dtype)
-        sigmas = repeat(sigmas, "b c n -> b c (n l)", l=self.split_length)
+        sigmas = torch.rand((b, 1, self.num_splits), device=device, dtype=dtype)
+        sigmas = repeat(sigmas, "b 1 n -> b 1 (n l)", l=self.split_length)
         # Get noise
         noise = torch.randn_like(x)
         # Combine input and noise weighted by half-circle
@@ -79,7 +79,7 @@ class DiffusionAR1d(nn.Module):
 
         s, l = num_steps // self.num_splits, self.split_length  # noqa
         sigmas = torch.linspace(1, 0, s * n, device=self.device)
-        sigmas = repeat(sigmas, "(n s) -> s b c (n l)", b=b, c=c, l=l, n=n)
+        sigmas = repeat(sigmas, "(n s) -> s b 1 (n l)", b=b, l=l, n=n)
         sigmas = torch.flip(sigmas, dims=[-1])  # Lowest noise level first
         sigmas = F.pad(sigmas, pad=[0, 0, 0, 0, 0, 0, 0, 1])  # Add index i+1
         sigmas[-1, :, :, l:] = sigmas[0, :, :, :-l]  # Loop back at index i+1
@@ -93,6 +93,7 @@ class DiffusionAR1d(nn.Module):
         for _ in progress_bar:
             # Get last n chunks
             x_noisy = torch.cat(chunks[-n:], dim=-1)
+            print(x_noisy.shape)
             # Decrease noise by one level
             for i in range(s):
                 v_pred = self.net(x_noisy, channels_list=[sigmas[i]], **kwargs)
@@ -113,7 +114,7 @@ class DiffusionAR1d(nn.Module):
         """Samples a single block of length `length` in one go"""
         b, c, t = num_items, self.in_channels, self.length
         sigmas = torch.linspace(1, 0, num_steps + 1, device=self.device)
-        sigmas = repeat(sigmas, "i -> i b c t", b=b, c=c, t=t)
+        sigmas = repeat(sigmas, "i -> i b 1 t", b=b, t=t)
         alphas, betas = self.get_alpha_beta(sigmas)
         x_noisy = torch.randn((b, c, t), device=self.device) * sigmas[0]
         progress_bar = tqdm(range(num_steps), disable=not show_progress)

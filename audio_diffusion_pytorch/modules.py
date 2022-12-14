@@ -1332,8 +1332,8 @@ def UNetSTFT1dType(
     return UNetSTFT1d
 
 
-def XUNet1dType(types: Tuple[Type[UNet1d]]) -> Type[UNet1d]:
-    class XUNet1d(types):  # type: ignore
+def XUNet1dType(types: Sequence[Type[UNet1d]]) -> Type[UNet1d]:
+    class XUNet1d(*types):  # type: ignore
         pass
 
     return XUNet1d
